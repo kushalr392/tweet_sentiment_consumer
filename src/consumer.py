@@ -2,11 +2,12 @@
 import os
 import json
 import logging
+import time
+import threading
 from dotenv import load_dotenv
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
-from textblob import TextBlob
-import time
+from .sentiment_analyzer import analyze_sentiment
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,17 +19,17 @@ load_dotenv(dotenv_path='./config/.env')
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 KAFKA_USERNAME = os.getenv('KAFKA_USERNAME')
 KAFKA_PASSWORD = os.getenv('KAFKA_PASSWORD')
-KAFKA_INPUT_TOPIC = os.getenv('KAFKA_INPUT_TOPIC', 'tweets_input')
-KAFKA_POSITIVE_TOPIC = os.getenv('KAFKA_POSITIVE_TOPIC', 'tweets_positive')
-KAFKA_NEGATIVE_TOPIC = os.getenv('KAFKA_NEGATIVE_TOPIC', 'tweets_negative')
-KAFKA_DEAD_LETTER_TOPIC = os.getenv('KAFKA_DEAD_LETTER_TOPIC', 'tweets_dead_letter')
+KAFKA_REVIEW_INPUT_TOPIC = os.getenv('KAFKA_REVIEW_INPUT_TOPIC', 'product_reviews')
+KAFKA_POSITIVE_TOPIC = os.getenv('KAFKA_POSITIVE_TOPIC', 'product_reviews_positive')
+KAFKA_NEGATIVE_TOPIC = os.getenv('KAFKA_NEGATIVE_TOPIC', 'product_reviews_negative')
+KAFKA_DEAD_LETTER_TOPIC = os.getenv('KAFKA_DEAD_LETTER_TOPIC', 'review_dead_letter')
 
 # SASL configuration
 SASL_MECHANISM = 'SCRAM-SHA-512'
 SECURITY_PROTOCOL = 'SASL_PLAINTEXT' # Use SASL_SSL if TLS is enabled
 
-# Consumer and Producer settings
-CONSUMER_GROUP_ID = 'sentiment_analysis_group'
+# Consumer settings
+CONSUMER_GROUP_ID = 'product_sentiment_analysis_group'
 AUTO_OFFSET_RESET = 'earliest'
 VALUE_DESERIALIZER = lambda m: json.loads(m.decode('utf-8'))
 VALUE_SERIALIZER = lambda m: json.dumps(m).encode('utf-8')
@@ -41,7 +42,7 @@ def create_kafka_consumer():
     """Creates and returns a KafkaConsumer instance."""
     try:
         consumer = KafkaConsumer(
-            KAFKA_INPUT_TOPIC,
+            KAFKA_REVIEW_INPUT_TOPIC,
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             group_id=CONSUMER_GROUP_ID,
             auto_offset_reset=AUTO_OFFSET_RESET,
@@ -52,7 +53,7 @@ def create_kafka_consumer():
             sasl_plain_password=KAFKA_PASSWORD,
             value_deserializer=VALUE_DESERIALIZER
         )
-        logging.info(f"Kafka Consumer connected to {KAFKA_BOOTSTRAP_SERVERS} for topic {KAFKA_INPUT_TOPIC}")
+        logging.info(f"Kafka Consumer connected to {KAFKA_BOOTSTRAP_SERVERS} for topic {KAFKA_REVIEW_INPUT_TOPIC}")
         return consumer
     except KafkaError as e:
         logging.error(f"Error creating Kafka Consumer: {e}")
@@ -75,19 +76,8 @@ def create_kafka_producer():
         logging.error(f"Error creating Kafka Producer: {e}")
         raise
 
-def analyze_sentiment(text):
-    """Performs sentiment analysis on the given text."""
-    analysis = TextBlob(text)
-    # Return 'positive', 'negative', or 'neutral'
-    if analysis.sentiment.polarity > 0:
-        return 'positive'
-    elif analysis.sentiment.polarity < 0:
-        return 'negative'
-    else:
-        return 'neutral'
-
 def send_to_dead_letter_topic(producer, original_message, error_details):
-    """Sends a message to the dead-letter topic."""
+    """Sends a message to the dead-letter topic using a provided producer."""
     dead_letter_message = {
         'original_message': original_message,
         'error': str(error_details),
@@ -100,47 +90,64 @@ def send_to_dead_letter_topic(producer, original_message, error_details):
     except KafkaError as e:
         logging.error(f"Failed to send to dead-letter topic: {e}")
 
-def process_message(producer, message):
-    """Processes a single Kafka message."""
-    tweet_data = message.value
-    if not isinstance(tweet_data, dict) or 'tweetContents' not in tweet_data:
-        logging.error(f"Invalid message format received: {tweet_data}. Skipping.")
-        send_to_dead_letter_topic(producer, tweet_data, "Invalid message format")
+def process_message(dead_letter_producer, sentiment_producer, message, shared_sentiment_data, lock):
+    """Processes a single Kafka message, aggregates sentiment, and updates shared data."""
+    review_data = message.value
+    
+    # Check for the expected keys from the input data (product and tweetContents)
+    if not isinstance(review_data, dict) or 'product' not in review_data or 'tweetContents' not in review_data:
+        logging.error(f"Invalid message format received: {review_data}. Skipping.")
+        send_to_dead_letter_topic(dead_letter_producer, review_data, "Invalid message format: Missing product or tweetContents")
         return
 
-    tweet_content = tweet_data['tweetContents']
-    sentiment = analyze_sentiment(tweet_content)
-    tweet_data['sentiment'] = sentiment
+    product_name = review_data['product'] # Extract from 'product' field
+    review_content = review_data['tweetContents'] # Extract from 'tweetContents' field
+    sentiment = analyze_sentiment(review_content)
+    review_data['sentiment'] = sentiment # Add sentiment to the review data
 
-    try:
+    with lock:
+        if product_name not in shared_sentiment_data:
+            shared_sentiment_data[product_name] = {'positive': 0, 'negative': 0}
         if sentiment == 'positive':
-            producer.send(KAFKA_POSITIVE_TOPIC, tweet_data)
-            logging.info(f"Sent positive tweet to {KAFKA_POSITIVE_TOPIC}: {tweet_data['userId']}")
+            shared_sentiment_data[product_name]['positive'] += 1
+            try:
+                sentiment_producer.send(KAFKA_POSITIVE_TOPIC, review_data)
+                logging.info(f"Sent positive review to {KAFKA_POSITIVE_TOPIC}: {review_data.get('userId', 'N/A')}")
+            except KafkaError as e:
+                logging.error(f"Failed to send positive review to topic: {e}")
+                send_to_dead_letter_topic(dead_letter_producer, review_data, f"Failed to send positive review: {e}")
         elif sentiment == 'negative':
-            producer.send(KAFKA_NEGATIVE_TOPIC, tweet_data)
-            logging.info(f"Sent negative tweet to {KAFKA_NEGATIVE_TOPIC}: {tweet_data['userId']}")
+            shared_sentiment_data[product_name]['negative'] += 1
+            try:
+                sentiment_producer.send(KAFKA_NEGATIVE_TOPIC, review_data)
+                logging.info(f"Sent negative review to {KAFKA_NEGATIVE_TOPIC}: {review_data.get('userId', 'N/A')}")
+            except KafkaError as e:
+                logging.error(f"Failed to send negative review to topic: {e}")
+                send_to_dead_letter_topic(dead_letter_producer, review_data, f"Failed to send negative review: {e}")
         else:
-            # Optionally send neutral tweets to a specific topic or log them
-            logging.info(f"Neutral tweet received (not sent to specific topic): {tweet_data['userId']}")
-        producer.flush()
-    except KafkaError as e:
-        logging.error(f"Failed to send message to output topic for tweet {tweet_data.get('userId', 'N/A')}: {e}")
-        send_to_dead_letter_topic(producer, tweet_data, e)
+            logging.info(f"Neutral review received (not sent to specific sentiment topic): {review_data.get('userId', 'N/A')}")
+        sentiment_producer.flush()
+        logging.info(f"Aggregated sentiment for {product_name}: {sentiment}. Current counts: {shared_sentiment_data[product_name]}")
 
-def run_consumer():
-    """Runs the Kafka consumer to process messages."""
+def consumer_task(shared_sentiment_data, lock, consumer_config):
+    """
+    Task for the consumer thread.
+    Consumes messages, performs sentiment analysis, and updates shared sentiment data.
+    """
     consumer = None
-    producer = None
+    dead_letter_producer = None # Producer specifically for dead-letter messages from consumer
+    sentiment_producer = None # Producer for positive/negative sentiment topics
     try:
         consumer = create_kafka_consumer()
-        producer = create_kafka_producer()
+        dead_letter_producer = create_kafka_producer()
+        sentiment_producer = create_kafka_producer()
 
         for message in consumer:
             retries = 0
             while retries < MAX_RETRIES:
                 try:
                     logging.info(f"Received message: Topic={message.topic}, Partition={message.partition}, Offset={message.offset}")
-                    process_message(producer, message)
+                    process_message(dead_letter_producer, sentiment_producer, message, shared_sentiment_data, lock)
                     break # Success, break out of retry loop
                 except Exception as e:
                     retries += 1
@@ -149,7 +156,7 @@ def run_consumer():
                         time.sleep(RETRY_BACKOFF_MS / 1000) # Convert ms to seconds
                     else:
                         logging.error(f"Max retries reached for message: {message.value}. Sending to dead-letter topic.")
-                        send_to_dead_letter_topic(producer, message.value, e)
+                        send_to_dead_letter_topic(dead_letter_producer, message.value, e)
                         break # Max retries reached, move to next message
 
     except KeyboardInterrupt:
@@ -160,9 +167,9 @@ def run_consumer():
         if consumer:
             consumer.close()
             logging.info("Kafka Consumer closed.")
-        if producer:
-            producer.close()
-            logging.info("Kafka Producer closed.")
-
-if __name__ == "__main__":
-    run_consumer()
+        if dead_letter_producer:
+            dead_letter_producer.close()
+            logging.info("Kafka Dead-Letter Producer closed for dead-letter topic.")
+        if sentiment_producer:
+            sentiment_producer.close()
+            logging.info("Kafka Sentiment Producer closed for sentiment topics.")
